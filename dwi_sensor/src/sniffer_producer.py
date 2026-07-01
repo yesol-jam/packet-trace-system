@@ -1,8 +1,4 @@
-import gc
-import os
-import socket
 import sys
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,9 +33,8 @@ from settings import (
 # 전역 변수
 packet_queue = Queue(maxsize=PACKET_QUEUE_MAXSIZE)
 
-# 오버플로우 시 임시 저장 버퍼
-overflow_buffer = [] 
-overflow_lock = threading.Lock()
+# 오버플로우 큐 (메인 스레드 → overflow_io_worker)
+overflow_queue = Queue()
 
 # 패킷 처리 함수
 def packet_handler(packet):
@@ -120,17 +115,32 @@ def kafka_batch_sender():
             logger.warning(f"Kafka 전송 {max_retries}번 모두 실패. 백업 파일로 저장합니다.")
             save_error_backup(batch)
 
-# 오버플로우 버퍼에 데이터 추가
+# 오버플로우 버퍼에 데이터 추가 (인메모리, 락 없음, I/O 없음)
 def add_to_overflow_buffer(data):
-    global overflow_buffer
-    
-    with overflow_lock:
-        overflow_buffer.append(data)
-        
-        # 버퍼가 가득 차면 파일로 일괄 저장
-        if len(overflow_buffer) >= OVERFLOW_BUFFER_SIZE:
-            save_overflow_batch(overflow_buffer.copy())
-            overflow_buffer.clear()
+    overflow_queue.put_nowait(data)
+
+
+# 별도 스레드에서 오버플로우 I/O 처리
+def overflow_io_worker():
+    buffer = []
+    while common_state.running:
+        try:
+            data = overflow_queue.get(timeout=1)
+            buffer.append(data)
+            if len(buffer) >= OVERFLOW_BUFFER_SIZE:
+                save_overflow_batch(buffer.copy())
+                buffer.clear()
+        except Empty:
+            pass
+
+    # 종료 후 남은 데이터 처리
+    while not overflow_queue.empty():
+        try:
+            buffer.append(overflow_queue.get_nowait())
+        except Empty:
+            break
+    if buffer:
+        save_overflow_batch(buffer.copy())
 
 # 종료시 데이터 전송
 def flush_on_exit():
@@ -151,14 +161,9 @@ def flush_on_exit():
         }
         try:
             common_state.producer.send(TOPIC_NAME, batch)
+            common_state.producer.flush()
             logger.info(f"종료 전 최종 배치 전송: {len(batch['data'])}건")
         except Exception as e:
             logger.error(f"종료 전 Kafka 전송 실패: {e}")
             save_error_backup(batch)
-    
-    # 오버플로우 버퍼 데이터 처리
-    with overflow_lock:
-        if overflow_buffer:
-            save_overflow_batch(overflow_buffer.copy())
-            overflow_buffer.clear()
 

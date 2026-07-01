@@ -94,6 +94,7 @@ def backup_file_sender():
                         try:
                             batch = json.loads(line)
                             common_state.producer.send(TOPIC_NAME, batch)
+                            common_state.producer.flush()
                             successful_count += 1
                         except json.JSONDecodeError as e:
                             logger.error(f"JSON 파싱 실패 (손상된 라인 건너뜀): {line[:100]}")
